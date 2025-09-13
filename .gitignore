@@ -1,0 +1,16 @@
+# Zig
+.zig-cache/
+zig-build/
+build/
+docgen_tmp/
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project
+local/
