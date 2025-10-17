@@ -161,6 +161,12 @@ pub fn BroadcastChannel(comptime T: type) type {
                     self.not_empty.broadcast();
                 }
             }
+
+            fn getSubscriberCount(self: *Inner) usize {
+                self.lock.lock();
+                defer self.lock.unlock();
+                return self.subscribers.items.len;
+            }
         };
 
         const Subscription = struct {
@@ -225,7 +231,7 @@ pub fn BroadcastChannel(comptime T: type) type {
                     self.inner.lock.lock();
                     const is_closed = self.inner.closed;
                     self.inner.lock.unlock();
-                    
+
                     if (is_closed) return Error.Closed;
                 }
             }
@@ -294,6 +300,11 @@ pub fn BroadcastChannel(comptime T: type) type {
                 if (self.released.swap(true, .acq_rel) == false) {
                     self.inner.release();
                 }
+            }
+
+            pub fn getSubscriptionCount(self: Controller) usize {
+                if (self.released.load(.acquire)) return 0;
+                return self.inner.getSubscriberCount();
             }
         };
 

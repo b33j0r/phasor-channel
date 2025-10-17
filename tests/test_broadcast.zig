@@ -131,8 +131,8 @@ test "Broadcast across threads (fan-out 10 messages)" {
             break;
         }
     }
-    try std.testing.expectEqual(@as(usize, 10), count1);
-    try std.testing.expectEqual(@as(usize, 45), sum1);
+    try std.testing.expectEqual(10, count1);
+    try std.testing.expectEqual(45, sum1);
 
     var sum2: usize = 0;
     var count2: usize = 0;
@@ -145,8 +145,8 @@ test "Broadcast across threads (fan-out 10 messages)" {
             break;
         }
     }
-    try std.testing.expectEqual(@as(usize, 10), count2);
-    try std.testing.expectEqual(@as(usize, 45), sum2);
+    try std.testing.expectEqual(10, count2);
+    try std.testing.expectEqual(45, sum2);
 }
 
 test "Broadcast idempotent deinit" {
@@ -257,6 +257,31 @@ test "Broadcast subscribe after close yields immediately-closed receiver" {
     try std.testing.expectError(BroadcastChannel(i32).Error.Closed, rx.recv());
 }
 
+test "Broadcast getSubscriptionCount" {
+    const allocator = std.testing.allocator;
+
+    var bc = try BroadcastChannel(i32).create(allocator, 4);
+    defer bc.sender.deinit();
+    defer bc.controller.deinit();
+
+    try std.testing.expectEqual(0, bc.controller.getSubscriptionCount());
+
+    var rx1 = try bc.controller.subscribe();
+    defer rx1.deinit();
+    try std.testing.expectEqual(1, bc.controller.getSubscriptionCount());
+
+    var rx2 = try bc.controller.subscribe();
+    defer rx2.deinit();
+    try std.testing.expectEqual(2, bc.controller.getSubscriptionCount());
+
+    rx1.deinit();
+    try std.testing.expectEqual(1, bc.controller.getSubscriptionCount());
+
+    rx2.deinit();
+    try std.testing.expectEqual(0, bc.controller.getSubscriptionCount());
+}
+
+// Import
 const std = @import("std");
 const channel = @import("phasor-channel");
 const BroadcastChannel = channel.BroadcastChannel;
