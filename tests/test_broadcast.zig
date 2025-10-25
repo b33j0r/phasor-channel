@@ -63,7 +63,7 @@ test "Broadcast multiple subscribers receive same messages" {
     try std.testing.expectError(BroadcastChannel(i32).Error.Closed, rx2.recv());
 }
 
-test "Broadcast trySend when buffer is full" {
+test "Broadcast trySend when buffer is full drops old events" {
     const allocator = std.testing.allocator;
 
     // Small capacity to hit the full condition easily
@@ -78,23 +78,23 @@ test "Broadcast trySend when buffer is full" {
     try bc.sender.send(1);
     try bc.sender.send(2);
 
-    // Non-blocking trySend should fail when full
+    // When full, trySend drops oldest event and succeeds
     const ok = try bc.sender.trySend(3);
-    try std.testing.expect(!ok);
+    try std.testing.expect(ok);
 
-    // Drain one
+    // The oldest event (1) was dropped, so we should get 2 and 3
     const a = try rx.recv();
-    try std.testing.expectEqual(@as(i32, 1), a);
+    try std.testing.expectEqual(@as(i32, 2), a);
 
-    // Now trySend should succeed
-    const ok2 = try bc.sender.trySend(3);
+    const b = try rx.recv();
+    try std.testing.expectEqual(@as(i32, 3), b);
+
+    // Now buffer is empty, trySend should succeed normally
+    const ok2 = try bc.sender.trySend(4);
     try std.testing.expect(ok2 == true);
 
-    // Drain remaining
-    const b = try rx.recv();
     const c = try rx.recv();
-    try std.testing.expectEqual(@as(i32, 2), b);
-    try std.testing.expectEqual(@as(i32, 3), c);
+    try std.testing.expectEqual(@as(i32, 4), c);
 
     bc.sender.close();
     try std.testing.expectError(BroadcastChannel(i32).Error.Closed, rx.recv());

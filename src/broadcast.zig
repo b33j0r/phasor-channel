@@ -72,11 +72,22 @@ pub fn BroadcastChannel(comptime T: type) type {
 
                 if (self.closed) return Error.Closed;
 
-                // Wait while buffer is full
-                while ((self.head - self.tail) >= self.cap and !self.closed) {
-                    self.not_full.wait(&self.lock);
+                // If buffer is full, drop oldest events for slow readers
+                if ((self.head - self.tail) >= self.cap) {
+                    const new_tail = self.head - self.cap + 1;
+                    const dropped = new_tail - self.tail;
+
+                    // Advance all slow subscriber cursors to the new tail
+                    for (self.subscribers.items) |sub| {
+                        const cursor = sub.cursor.load(.monotonic);
+                        if (cursor < new_tail) {
+                            sub.cursor.store(new_tail, .release);
+                        }
+                    }
+
+                    self.tail = new_tail;
+                    std.log.warn("BroadcastChannel full: dropping {} old events", .{dropped});
                 }
-                if (self.closed) return Error.Closed;
 
                 // Write to ring buffer
                 const idx = self.head % self.cap;
@@ -91,7 +102,23 @@ pub fn BroadcastChannel(comptime T: type) type {
                 defer self.lock.unlock();
 
                 if (self.closed) return Error.Closed;
-                if ((self.head - self.tail) >= self.cap) return false;
+
+                // If buffer is full, drop oldest events for slow readers
+                if ((self.head - self.tail) >= self.cap) {
+                    const new_tail = self.head - self.cap + 1;
+                    const dropped = new_tail - self.tail;
+
+                    // Advance all slow subscriber cursors to the new tail
+                    for (self.subscribers.items) |sub| {
+                        const cursor = sub.cursor.load(.monotonic);
+                        if (cursor < new_tail) {
+                            sub.cursor.store(new_tail, .release);
+                        }
+                    }
+
+                    self.tail = new_tail;
+                    std.log.warn("BroadcastChannel full (trySend): dropping {} old events", .{dropped});
+                }
 
                 const idx = self.head % self.cap;
                 self.buf[idx] = value;
