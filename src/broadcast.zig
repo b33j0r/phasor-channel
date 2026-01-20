@@ -9,7 +9,6 @@ pub fn BroadcastChannel(comptime T: type) type {
 
         pub fn create(allocator: std.mem.Allocator, capacity: usize) !struct { sender: Sender, controller: Controller } {
             if (capacity == 0) return error.InvalidCapacity;
-
             const buf = try allocator.alloc(T, capacity);
 
             const inner = try allocator.create(Inner);
@@ -33,8 +32,8 @@ pub fn BroadcastChannel(comptime T: type) type {
 
             buf: []T,
             cap: usize,
-            head: u64 = 0, // monotonic write position
-            tail: u64 = 0, // monotonic read position (slowest reader)
+            head_atomic: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+            tail_atomic: std.atomic.Value(u64) = std.atomic.Value(u64).init(0), // monotonic read position (slowest reader)
 
             closed: bool = false,
 
@@ -72,27 +71,30 @@ pub fn BroadcastChannel(comptime T: type) type {
 
                 if (self.closed) return Error.Closed;
 
+                const head = self.head_atomic.load(.acquire);
+                const tail = self.tail_atomic.load(.acquire);
+
                 // If buffer is full, drop oldest events for slow readers
-                if ((self.head - self.tail) >= self.cap) {
-                    const new_tail = self.head - self.cap + 1;
-                    const dropped = new_tail - self.tail;
+                if ((head - tail) >= self.cap) {
+                    const new_tail = head - self.cap + 1;
+                    const dropped = new_tail - tail;
 
                     // Advance all slow subscriber cursors to the new tail
                     for (self.subscribers.items) |sub| {
-                        const cursor = sub.cursor.load(.monotonic);
+                        const cursor = sub.cursor.load(.acquire);
                         if (cursor < new_tail) {
                             sub.cursor.store(new_tail, .release);
                         }
                     }
 
-                    self.tail = new_tail;
-                    std.log.warn("BroadcastChannel full: dropping {} old events", .{dropped});
+                    self.tail_atomic.store(new_tail, .release);
+                    std.log.info("BroadcastChannel full: dropping {} old events", .{dropped});
                 }
 
                 // Write to ring buffer
-                const idx = self.head % self.cap;
+                const idx = head % self.cap;
                 self.buf[idx] = value;
-                self.head += 1;
+                self.head_atomic.store(head + 1, .release);
 
                 self.not_empty.broadcast();
             }
@@ -103,26 +105,29 @@ pub fn BroadcastChannel(comptime T: type) type {
 
                 if (self.closed) return Error.Closed;
 
+                const head = self.head_atomic.load(.acquire);
+                const tail = self.tail_atomic.load(.acquire);
+
                 // If buffer is full, drop oldest events for slow readers
-                if ((self.head - self.tail) >= self.cap) {
-                    const new_tail = self.head - self.cap + 1;
-                    const dropped = new_tail - self.tail;
+                if ((head - tail) >= self.cap) {
+                    const new_tail = head - self.cap + 1;
+                    const dropped = new_tail - tail;
 
                     // Advance all slow subscriber cursors to the new tail
                     for (self.subscribers.items) |sub| {
-                        const cursor = sub.cursor.load(.monotonic);
+                        const cursor = sub.cursor.load(.acquire);
                         if (cursor < new_tail) {
                             sub.cursor.store(new_tail, .release);
                         }
                     }
 
-                    self.tail = new_tail;
-                    std.log.warn("BroadcastChannel full (trySend): dropping {} old events", .{dropped});
+                    self.tail_atomic.store(new_tail, .release);
+                    std.log.info("BroadcastChannel full (trySend): dropping {} old events", .{dropped});
                 }
 
-                const idx = self.head % self.cap;
+                const idx = head % self.cap;
                 self.buf[idx] = value;
-                self.head += 1;
+                self.head_atomic.store(head + 1, .release);
 
                 self.not_empty.broadcast();
                 return true;
@@ -134,7 +139,7 @@ pub fn BroadcastChannel(comptime T: type) type {
 
                 const sub = try self.allocator.create(Subscription);
                 sub.* = .{
-                    .cursor = std.atomic.Value(u64).init(self.tail), // Start at tail (oldest available)
+                    .cursor = std.atomic.Value(u64).init(self.tail_atomic.load(.acquire)), // Start at tail (oldest available)
                     .inner = self,
                 };
 
@@ -164,18 +169,18 @@ pub fn BroadcastChannel(comptime T: type) type {
             fn updateTail(self: *Inner) void {
                 // Must be called with lock held
                 if (self.subscribers.items.len == 0) {
-                    self.tail = self.head;
+                    self.tail_atomic.store(self.head_atomic.load(.acquire), .release);
                     return;
                 }
 
                 var min_cursor: u64 = std.math.maxInt(u64);
                 for (self.subscribers.items) |sub| {
-                    const cursor = sub.cursor.load(.monotonic);
+                    const cursor = sub.cursor.load(.acquire);
                     if (cursor < min_cursor) {
                         min_cursor = cursor;
                     }
                 }
-                self.tail = min_cursor;
+                self.tail_atomic.store(min_cursor, .release);
             }
 
             fn doClose(self: *Inner) void {
@@ -204,29 +209,35 @@ pub fn BroadcastChannel(comptime T: type) type {
             fn tryRecv(self: *Subscription) ?T {
                 if (self.released.load(.acquire)) return null;
 
+                // Optimization: Quick check without lock
+                const cursor = self.cursor.load(.acquire);
+                const head = self.inner.head_atomic.load(.acquire);
+                if (cursor >= head) return null;
+
                 self.inner.lock.lock();
                 defer self.inner.lock.unlock();
 
-                const cursor = self.cursor.load(.monotonic);
-                const head = self.inner.head;
-                const tail = self.inner.tail;
+                // Re-check head after acquiring lock, though it's likely still ahead
+                const head_locked = self.inner.head_atomic.load(.acquire);
+                const tail = self.inner.tail_atomic.load(.acquire);
 
                 // Check if we've fallen behind
                 if (cursor < tail) {
                     const dropped = tail - cursor;
-                    std.log.warn("BroadcastChannel subscriber dropped {} events, advancing cursor", .{dropped});
-                    self.cursor.store(tail, .monotonic);
+                    std.log.info("BroadcastChannel subscriber dropped {} events, advancing cursor", .{dropped});
+                    self.cursor.store(tail, .release);
                     self.inner.updateTail();
                     self.inner.not_full.signal();
-                    return self.tryRecv();
+                    // Don't recurse with tryRecv here to avoid potential issues with tryLock
+                    return null;
                 }
 
-                // Check if data is available
-                if (cursor >= head) return null;
+                // Check if data is available (locked state)
+                if (cursor >= head_locked) return null;
 
                 const idx = cursor % self.inner.cap;
                 const value = self.inner.buf[idx];
-                self.cursor.store(cursor + 1, .monotonic);
+                self.cursor.store(cursor + 1, .release);
 
                 // Update global tail if we were the slowest reader
                 if (cursor == tail) {
@@ -355,9 +366,7 @@ pub fn BroadcastChannel(comptime T: type) type {
             }
 
             pub fn next(self: Receiver) ?T {
-                return self.recv() catch |err| {
-                    if (err == Error.Closed) return null else unreachable;
-                };
+                return self.tryRecv();
             }
 
             pub fn deinit(self: *Receiver) void {
